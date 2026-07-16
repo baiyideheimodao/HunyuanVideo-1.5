@@ -543,10 +543,10 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
         self.use_temporal_tiling = False
 
         # only relevant if vae tiling is enabled
-        self.tile_sample_min_size = sample_size
-        self.tile_latent_min_size = sample_size // ffactor_spatial
-        self.tile_sample_min_tsize = sample_tsize
-        self.tile_latent_min_tsize = sample_tsize // ffactor_temporal
+        self.tile_sample_min_size =  128 //sample_size
+        self.tile_latent_min_size =  128 //sample_size // ffactor_spatial
+        self.tile_sample_min_tsize = 16 //sample_tsize
+        self.tile_latent_min_tsize = 16 // sample_tsize // ffactor_temporal
         self.tile_overlap_factor = 0.25
 
         self._tile_parallelism_enabled = False

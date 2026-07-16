@@ -169,3 +169,5 @@ ckpts/
 
 
 hyvideo/utils/rewrite/i2v_env.sh
+hfd.sh
+flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.1.whl
