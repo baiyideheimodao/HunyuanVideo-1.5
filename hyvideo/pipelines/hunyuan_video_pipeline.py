@@ -1259,6 +1259,11 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                     if progress_bar is not None:
                         progress_bar.update()
 
+        # Offload DiT (Transformer) to CPU to save GPU memory before VAE decoding
+        if hasattr(self, 'transformer') and self.transformer is not None:
+            self.transformer = self.transformer.to('cpu')
+            torch.cuda.empty_cache()
+
         if enable_sr:
             assert hasattr(self, 'sr_pipeline')
             sr_out = self.sr_pipeline(
