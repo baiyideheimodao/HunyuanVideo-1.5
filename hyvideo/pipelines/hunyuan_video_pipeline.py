@@ -48,6 +48,8 @@ from hyvideo.commons import (
     get_rank,
     is_flash3_available,
     is_angelslim_available,
+    _get_top_level_group_offload_hook,
+    _is_group_offload_enabled,
 )
 from hyvideo.commons.parallel_states import get_parallel_state
 
@@ -1094,6 +1096,16 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                 '\n'
             )
 
+        # Check if offloading is properly configured before inference
+        if self.enable_offloading:
+            if _is_group_offload_enabled(self.transformer):
+                loguru.logger.info("✓ Transformer group offloading is enabled and configured")
+                hook = _get_top_level_group_offload_hook(self.transformer)
+                if hook is None:
+                    loguru.logger.warning("⚠ Transformer group offloading hook not found. May cause OOM during VAE decode.")
+            else:
+                loguru.logger.info("✓ Transformer will be offloaded to CPU via .to('cpu')")
+
         with auto_offload_model(self.text_encoder, self.execution_device, enabled=self.enable_offloading):
             (
                 prompt_embeds,
@@ -1261,8 +1273,16 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
 
         # Offload DiT (Transformer) to CPU to save GPU memory before VAE decoding
         if hasattr(self, 'transformer') and self.transformer is not None:
-            self.transformer = self.transformer.to('cpu')
-            torch.cuda.empty_cache()
+            if _is_group_offload_enabled(self.transformer):
+                hook = _get_top_level_group_offload_hook(self.transformer)
+                if hook is not None and hasattr(hook, 'group'):
+                    try:
+                        hook.group.offload_()
+                    except Exception:
+                        pass
+            else:
+                self.transformer = self.transformer.to('cpu')
+        torch.cuda.empty_cache()
 
         if enable_sr:
             assert hasattr(self, 'sr_pipeline')
@@ -1298,6 +1318,28 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
 
             if enable_vae_tile_parallelism and hasattr(self.vae, 'enable_tile_parallelism'):
                 self.vae.enable_tile_parallelism()
+
+            # Check available GPU memory before VAE decoding
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                reserved_mem = torch.cuda.memory_reserved() / 1024**3
+                allocated_mem = torch.cuda.memory_allocated() / 1024**3
+                total_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                available_mem = total_mem - allocated_mem
+                
+                if get_rank() == 0:
+                    loguru.logger.info(f"VAE Decode Memory Status: {allocated_mem:.2f}GB allocated, {available_mem:.2f}GB available, {total_mem:.2f}GB total")
+                
+                # If available memory is low, auto-adjust VAE tiling
+                if available_mem < 5.0:
+                    if get_rank() == 0:
+                        loguru.logger.warning(f"Low GPU memory ({available_mem:.2f}GB available). Auto-enabling VAE tiling with smaller tiles.")
+                    if hasattr(self.vae, 'enable_tiling'):
+                        self.vae.enable_tiling()
+                    if hasattr(self.vae, 'set_tile_sample_min_size'):
+                        self.vae.set_tile_sample_min_size(sample_size=64, tile_overlap_factor=0.25)
+                        if get_rank() == 0:
+                            loguru.logger.info(f"VAE tile size adjusted to 64x64 for memory efficiency")
 
             if return_pre_sr_video or not enable_sr:
                 with torch.autocast(device_type="cuda", dtype=self.vae_dtype, enabled=self.vae_autocast_enabled), auto_offload_model(self.vae, self.execution_device, enabled=self.enable_offloading), self.vae.memory_efficient_context():
@@ -1416,6 +1458,8 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             if overlap_group_offloading:
                 group_offloading_kwargs['use_stream'] = True
             self.transformer.enable_group_offload(**group_offloading_kwargs)
+            if hasattr(self.vae, 'enable_group_offload'):
+                self.vae.enable_group_offload(**group_offloading_kwargs)
 
     @classmethod
     def load_sr_transformer_upsampler(cls, cached_folder, sr_version, transformer_dtype=torch.bfloat16, device=None):

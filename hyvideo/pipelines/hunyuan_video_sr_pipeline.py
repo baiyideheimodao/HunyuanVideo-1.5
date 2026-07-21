@@ -28,7 +28,7 @@ from diffusers.schedulers import KarrasDiffusionSchedulers
 from diffusers.utils import BaseOutput
 
 from hyvideo.commons.parallel_states import get_parallel_state
-from hyvideo.commons import auto_offload_model, get_rank
+from hyvideo.commons import auto_offload_model, get_rank, _get_top_level_group_offload_hook, _is_group_offload_enabled
 from hyvideo.models.text_encoders import TextEncoder
 from hyvideo.models.transformers.hunyuanvideo_1_5_transformer import (
     HunyuanVideo_1_5_DiffusionTransformer,
@@ -282,6 +282,19 @@ class HunyuanVideo_1_5_SR_Pipeline(HunyuanVideo_1_5_Pipeline):
                 f"{'=' * 60}\n"
             )
 
+        # Check if offloading is properly configured before SR inference
+        if self.enable_offloading:
+            if _is_group_offload_enabled(self.transformer):
+                if get_rank() == 0:
+                    print("✓ [SR] Transformer group offloading is enabled and configured")
+                hook = _get_top_level_group_offload_hook(self.transformer)
+                if hook is None:
+                    if get_rank() == 0:
+                        print("⚠ [SR] Transformer group offloading hook not found. May cause OOM during VAE decode.")
+            else:
+                if get_rank() == 0:
+                    print("✓ [SR] Transformer will be offloaded to CPU via .to('cpu')")
+
         with auto_offload_model(self.text_encoder, self.execution_device, enabled=self.enable_offloading):
             (
                 prompt_embeds,
@@ -437,7 +450,15 @@ class HunyuanVideo_1_5_SR_Pipeline(HunyuanVideo_1_5_Pipeline):
 
         # Offload Transformer and Upsampler to CPU to save GPU memory before VAE decoding
         if hasattr(self, 'transformer') and self.transformer is not None:
-            self.transformer = self.transformer.to('cpu')
+            if _is_group_offload_enabled(self.transformer):
+                hook = _get_top_level_group_offload_hook(self.transformer)
+                if hook is not None and hasattr(hook, 'group'):
+                    try:
+                        hook.group.offload_()
+                    except Exception:
+                        pass
+            else:
+                self.transformer = self.transformer.to('cpu')
         if hasattr(self, 'upsampler') and self.upsampler is not None:
             self.upsampler = self.upsampler.to('cpu')
         torch.cuda.empty_cache()
@@ -459,6 +480,29 @@ class HunyuanVideo_1_5_SR_Pipeline(HunyuanVideo_1_5_Pipeline):
 
             if enable_vae_tile_parallelism and hasattr(self.vae, 'enable_tile_parallelism'):
                 self.vae.enable_tile_parallelism()
+            
+            # Check available GPU memory before VAE decoding
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                reserved_mem = torch.cuda.memory_reserved() / 1024**3
+                allocated_mem = torch.cuda.memory_allocated() / 1024**3
+                total_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                available_mem = total_mem - allocated_mem
+                
+                if get_rank() == 0:
+                    print(f"[SR] VAE Decode Memory Status: {allocated_mem:.2f}GB allocated, {available_mem:.2f}GB available, {total_mem:.2f}GB total")
+                
+                # If available memory is low, auto-adjust VAE tiling
+                if available_mem < 5.0:
+                    if get_rank() == 0:
+                        print(f"[SR] Warning: Low GPU memory ({available_mem:.2f}GB available). Auto-enabling VAE tiling with smaller tiles.")
+                    if hasattr(self.vae, 'enable_tiling'):
+                        self.vae.enable_tiling()
+                    if hasattr(self.vae, 'set_tile_sample_min_size'):
+                        self.vae.set_tile_sample_min_size(sample_size=64, tile_overlap_factor=0.25)
+                        if get_rank() == 0:
+                            print(f"[SR] VAE tile size adjusted to 64x64 for memory efficiency")
+            
             with torch.autocast(device_type="cuda", dtype=self.vae_dtype, enabled=self.vae_autocast_enabled), auto_offload_model(self.vae, self.execution_device, enabled=self.enable_offloading):
                 self.vae.enable_tiling()
                 video_frames = self.vae.decode(latents, return_dict=False, generator=generator)[0]

@@ -21,6 +21,12 @@ from contextlib import contextmanager
 from torch import nn
 import collections.abc
 
+try:
+    from diffusers.hooks.group_offloading import _is_group_offload_enabled, _get_top_level_group_offload_hook
+except Exception:
+    _is_group_offload_enabled = lambda module: False
+    _get_top_level_group_offload_hook = lambda module: None
+
 def _ntuple(n):
     """Create a function that converts input to n-tuple."""
     def parse(x):
@@ -227,17 +233,26 @@ def maybe_fallback_attn_mode(attn_mode):
 
 @contextmanager
 def auto_offload_model(models, device, enabled=True):
-    from diffusers.hooks.group_offloading import _is_group_offload_enabled
     if enabled:
         if isinstance(models, nn.Module):
             models = [models]
         for model in models:
             if model is not None:
+                if _is_group_offload_enabled(model):
+                    continue
                 model.to(device)
     yield
     if enabled:
         for model in models:
             if model is not None:
+                if _is_group_offload_enabled(model):
+                    hook = _get_top_level_group_offload_hook(model)
+                    if hook is not None and hasattr(hook, 'group'):
+                        try:
+                            hook.group.offload_()
+                        except Exception:
+                            pass
+                    continue
                 model.to(torch.device('cpu'))
 
 def get_gpu_memory(device=None):
