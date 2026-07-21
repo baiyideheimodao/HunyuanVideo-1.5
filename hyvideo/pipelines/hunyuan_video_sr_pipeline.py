@@ -435,6 +435,13 @@ class HunyuanVideo_1_5_SR_Pipeline(HunyuanVideo_1_5_Pipeline):
                     if progress_bar is not None:
                         progress_bar.update()
 
+        # Offload Transformer and Upsampler to CPU to save GPU memory before VAE decoding
+        if hasattr(self, 'transformer') and self.transformer is not None:
+            self.transformer = self.transformer.to('cpu')
+        if hasattr(self, 'upsampler') and self.upsampler is not None:
+            self.upsampler = self.upsampler.to('cpu')
+        torch.cuda.empty_cache()
+
         if output_type == "latent":
             video_frames = latents
         else:
