@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# mkvideo — call the HunyuanVideo API server from the terminal.
+#
+# Usage:
+#   mkvideo -p "一只小猫在散步"
+#   mkvideo -p "一只小猫在散步" -vl 81
+#   mkvideo -i photo.jpg -p "人物向前走"
+#
+# The server must already be running (python server.py ...).
+
+set -euo pipefail
+
+API="${MKVIDEO_API:-http://localhost:8000}"
+PROMPT=""
+IMAGE=""
+VIDEO_LENGTH=""
+OUTPUT=""
+POLL_INTERVAL=5
+
+usage() {
+    cat <<'EOF'
+Usage:
+  mkvideo -p "PROMPT"              text-to-video
+  mkvideo -p "PROMPT" -vl 121      text-to-video with specific frame count
+  mkvideo -i PHOTO -p "PROMPT"     image-to-video
+  mkvideo -i PHOTO -p "PROMPT" -vl 81
+
+Options:
+  -p    Text prompt (required for t2v and i2v)
+  -i    Reference image path (enables i2v mode)
+  -vl   Video length in frames (overrides server default; max 121)
+  -o    Output filename (default: auto-generated from task ID)
+EOF
+    exit 1
+}
+
+# ── Parse args ──────────────────────────────────────────────────────────────
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -p) PROMPT="$2"; shift 2 ;;
+        -i) IMAGE="$2"; shift 2 ;;
+        -vl) VIDEO_LENGTH="$2"; shift 2 ;;
+        -o) OUTPUT="$2"; shift 2 ;;
+        -h|--help) usage ;;
+        *) echo "Unknown option: $1"; usage ;;
+    esac
+done
+
+if [[ -z "$PROMPT" ]]; then
+    echo "Error: -p PROMPT is required"
+    usage
+fi
+
+# ── Check server ─────────────────────────────────────────────────────────────
+
+if ! curl -s --connect-timeout 3 "$API/health" > /dev/null 2>&1; then
+    echo "Error: cannot reach server at $API"
+    echo "Start it first:  python server.py --model_path ./ckpts --resolution 480p"
+    exit 1
+fi
+
+# ── Submit task ──────────────────────────────────────────────────────────────
+
+echo "→ Submitting: $PROMPT"
+
+if [[ -n "$IMAGE" ]]; then
+    # i2v
+    if [[ ! -f "$IMAGE" ]]; then
+        echo "Error: image not found: $IMAGE"
+        exit 1
+    fi
+    VL_ARG=()
+    [[ -n "$VIDEO_LENGTH" ]] && VL_ARG=(-F "video_length=$VIDEO_LENGTH")
+    RESP=$(curl -s -X POST "$API/generate/i2v" \
+        -F "image=@$IMAGE" \
+        -F "prompt=$PROMPT" \
+        "${VL_ARG[@]}")
+else
+    # t2v — use Python to build safe JSON
+    PAYLOAD=$(PROMPT="$PROMPT" VL="$VIDEO_LENGTH" python3 -c "
+import json, os, sys
+d = {'prompt': os.environ['PROMPT']}
+vl = os.environ.get('VL', '')
+if vl:
+    d['video_length'] = int(vl)
+print(json.dumps(d))
+")
+    RESP=$(curl -s -X POST "$API/generate/t2v" \
+        -H "Content-Type: application/json" \
+        -d "$PAYLOAD")
+fi
+
+TASK_ID=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['task_id'])")
+echo "   task_id: $TASK_ID"
+
+# ── Poll until done ──────────────────────────────────────────────────────────
+
+while true; do
+    STATUS=$(curl -s "$API/task/$TASK_ID")
+    STATE=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+    STEP=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin)['step'])")
+    TOTAL=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin)['total'])")
+
+    case "$STATE" in
+        completed)
+            echo "   done!"
+            break
+            ;;
+        error)
+            ERR=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error','unknown'))")
+            echo "   failed: $ERR"
+            exit 1
+            ;;
+        running)
+            printf "\r   progress: %d/%d" "$STEP" "$TOTAL"
+            sleep "$POLL_INTERVAL"
+            ;;
+        queued)
+            printf "\r   waiting..."
+            sleep "$POLL_INTERVAL"
+            ;;
+    esac
+done
+
+# ── Download ─────────────────────────────────────────────────────────────────
+
+URL=$(echo "$STATUS" | python3 -c "import sys,json; print(json.load(sys.stdin)['output_url'])")
+OUTFILE="${OUTPUT:-${TASK_ID}.mp4}"
+curl -s -o "$OUTFILE" "$API$URL"
+echo "→ saved: $OUTFILE"

@@ -19,7 +19,9 @@ import psutil
 import inspect
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -1466,8 +1468,15 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             if overlap_group_offloading:
                 group_offloading_kwargs['use_stream'] = True
             self.transformer.enable_group_offload(**group_offloading_kwargs)
-            if hasattr(self.vae, 'enable_group_offload'):
-                self.vae.enable_group_offload(**group_offloading_kwargs)
+            # NOTE: VAE group offloading is disabled because it causes a device mismatch
+            # in the SR pipeline's tiled decode path. The VAE decoder's Conv3d weights
+            # remain on CPU while the input tiles are on CUDA, leading to:
+            #   RuntimeError: Input type (torch.cuda.HalfTensor) and weight type
+            #   (torch.HalfTensor) should be the same
+            # The VAE is small enough that regular auto_offload_model (full onload/offload)
+            # works correctly without memory issues.
+            # if hasattr(self.vae, 'enable_group_offload'):
+            #     self.vae.enable_group_offload(**group_offloading_kwargs)
 
     @classmethod
     def load_sr_transformer_upsampler(cls, cached_folder, sr_version, transformer_dtype=torch.bfloat16, device=None):
@@ -1561,22 +1570,70 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             }
 
         vae_inference_config = cls.get_vae_inference_config()
-        transformer = HunyuanVideo_1_5_DiffusionTransformer.from_pretrained(
-            **from_pretrain_kwargs,
-            torch_dtype=transformer_dtype, 
-            low_cpu_mem_usage=True,
-        ).to(transformer_init_device)
 
-        vae = hunyuanvideo_15_vae.AutoencoderKLConv3D.from_pretrained(
-            os.path.join(cached_folder, "vae"), 
-            torch_dtype=vae_inference_config['dtype']
-        ).to(device)
-        vae.set_tile_sample_min_size(vae_inference_config['sample_size'], vae_inference_config['tile_overlap_factor'])
+        # Load lightweight scheduler first (synchronous, takes <1s).
+        loguru.logger.info("[TIMING] Loading scheduler...")
         scheduler = FlowMatchDiscreteScheduler.from_pretrained(os.path.join(cached_folder, "scheduler"))
 
-        byt5_kwargs, prompt_format = cls._load_byt5(cached_folder, True, 256, device=device)
-        text_encoder, text_encoder_2 = cls._load_text_encoders(cached_folder, device=device)
-        vision_encoder = cls._load_vision_encoder(cached_folder, device=device)
+        # Load heavy models in parallel to overlap disk I/O waits.
+        # Each model is independent — loading them concurrently reduces total
+        # wall-clock time from sum(t_i) to max(t_i).
+        t_parallel = time.time()
+        loguru.logger.info("[TIMING] Loading models in parallel (3 threads)...")
+
+        def _load_transformer():
+            loguru.logger.info("[TIMING] Loading transformer...")
+            t = time.time()
+            m = HunyuanVideo_1_5_DiffusionTransformer.from_pretrained(
+                **from_pretrain_kwargs,
+                torch_dtype=transformer_dtype,
+                low_cpu_mem_usage=True,
+            ).to(transformer_init_device)
+            loguru.logger.info(f"[TIMING] Transformer loaded ({time.time() - t:.1f}s)")
+            return m
+
+        def _load_vae():
+            loguru.logger.info("[TIMING] Loading VAE...")
+            t = time.time()
+            m = hunyuanvideo_15_vae.AutoencoderKLConv3D.from_pretrained(
+                os.path.join(cached_folder, "vae"),
+                torch_dtype=vae_inference_config['dtype'],
+            ).to(device)
+            m.set_tile_sample_min_size(vae_inference_config['sample_size'], vae_inference_config['tile_overlap_factor'])
+            loguru.logger.info(f"[TIMING] VAE loaded ({time.time() - t:.1f}s)")
+            return m
+
+        def _load_byt5():
+            loguru.logger.info("[TIMING] Loading byT5...")
+            t = time.time()
+            result = cls._load_byt5(cached_folder, True, 256, device=device)
+            loguru.logger.info(f"[TIMING] byT5 loaded ({time.time() - t:.1f}s)")
+            return result
+
+        def _load_encoders():
+            loguru.logger.info("[TIMING] Loading text encoders...")
+            t = time.time()
+            te, te2 = cls._load_text_encoders(cached_folder, device=device)
+            loguru.logger.info(f"[TIMING] Text encoders loaded ({time.time() - t:.1f}s)")
+
+            loguru.logger.info("[TIMING] Loading vision encoder...")
+            t = time.time()
+            ve = cls._load_vision_encoder(cached_folder, device=device)
+            loguru.logger.info(f"[TIMING] Vision encoder loaded ({time.time() - t:.1f}s)")
+            return te, te2, ve
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            fut_transformer = executor.submit(_load_transformer)
+            fut_vae = executor.submit(_load_vae)
+            fut_byt5 = executor.submit(_load_byt5)
+            fut_encoders = executor.submit(_load_encoders)
+
+            transformer = fut_transformer.result()
+            vae = fut_vae.result()
+            byt5_kwargs, prompt_format = fut_byt5.result()
+            text_encoder, text_encoder_2, vision_encoder = fut_encoders.result()
+
+        loguru.logger.info(f"[TIMING] All models loaded in parallel ({time.time() - t_parallel:.1f}s)")
 
         pipeline = cls(
             vae=vae,
@@ -1596,9 +1653,12 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         )
 
         if create_sr_pipeline:
+            t_sr = time.time()
+            loguru.logger.info("[TIMING] Creating SR pipeline...")
             sr_version = TRANSFORMER_VERSION_TO_SR_VERSION[transformer_version]
             sr_pipeline = pipeline.create_sr_pipeline(cached_folder, sr_version, transformer_dtype=transformer_dtype, device=device)
             pipeline.sr_pipeline = sr_pipeline
+            loguru.logger.info(f"[TIMING] SR pipeline created ({time.time() - t_sr:.1f}s)")
 
 
         return pipeline

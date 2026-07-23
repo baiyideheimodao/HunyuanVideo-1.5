@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and limitations under the License.
 
 import os
+import time
 
 if 'PYTORCH_CUDA_ALLOC_CONF' not in os.environ:
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -125,7 +126,16 @@ def load_lora_adapter(pipe, lora_path):
         raise
     
 
+def _log_step(msg, start_time=None):
+    """Print a step header and optionally the elapsed time since start_time."""
+    msg = f"[TIMING] {msg}"
+    if start_time is not None:
+        elapsed = time.time() - start_time
+        msg = f"{msg}  (elapsed: {elapsed:.1f}s)"
+    rank0_log(msg, "INFO")
+
 def generate_video(args):
+    t_start = time.time()
 
     infer_state = initialize_infer_state(args)
 
@@ -179,6 +189,8 @@ def generate_video(args):
     else:
         transformer_init_device = device
     
+    _log_step("Creating pipeline (loading models)...", t_start)
+    t = time.time()
     pipe = HunyuanVideo_1_5_Pipeline.create_pipeline(
         pretrained_model_name_or_path=args.model_path,
         transformer_version=transformer_version,
@@ -187,33 +199,47 @@ def generate_video(args):
         device=device,
         transformer_init_device=transformer_init_device,
     )
-    
+    _log_step("Pipeline created", t)
+
     loguru.logger.info(f"{enable_offloading=} {enable_group_offloading=} {overlap_group_offloading=}")
-    
+
+    _log_step("Applying infer optimization to main pipeline...")
+    t = time.time()
     pipe.apply_infer_optimization(
         infer_state=infer_state,
         enable_offloading=enable_offloading,
         enable_group_offloading=enable_group_offloading,
         overlap_group_offloading=overlap_group_offloading,
     )
-    
+    _log_step("Main pipeline optimization done", t)
+
     # Load checkpoint if provided
     if args.checkpoint_path:
+        _log_step("Loading checkpoint...")
+        t = time.time()
         load_checkpoint_to_transformer(pipe, args.checkpoint_path)
-    
-    if args.lora_path:
-        load_lora_adapter(pipe, args.lora_path)
+        _log_step("Checkpoint loaded", t)
 
-    # Apply optimizations to SR pipeline if exists
+    if args.lora_path:
+        _log_step("Loading LoRA adapter...")
+        t = time.time()
+        load_lora_adapter(pipe, args.lora_path)
+        _log_step("LoRA adapter loaded", t)
+
+    # Apply optimizations to SR pipeline if exists.
+    # Note: SR pipeline shares the VAE with the main pipeline, so VAE offloading
+    # is already configured. Only enable offloading for the SR pipeline itself.
     if enable_sr and hasattr(pipe, 'sr_pipeline'):
+        _log_step("Applying infer optimization to SR pipeline...")
+        t = time.time()
         sr_infer_state = copy.deepcopy(infer_state)
-        sr_infer_state.enable_cache = False # SR pipeline does not require cache optimization yet
+        sr_infer_state.enable_cache = False  # SR pipeline does not require cache optimization yet
         pipe.sr_pipeline.apply_infer_optimization(
             infer_state=sr_infer_state,
             enable_offloading=enable_offloading,
-            enable_group_offloading=enable_group_offloading,
-            overlap_group_offloading=overlap_group_offloading,
+            enable_group_offloading=False,
         )
+        _log_step("SR pipeline optimization done", t)
 
     extra_kwargs = {}
     if task == 'i2v':
@@ -227,6 +253,8 @@ def generate_video(args):
     if not args.rewrite:
         rank0_log("Warning: Prompt rewriting is disabled. This may affect the quality of generated videos.", "WARNING")
 
+    _log_step("Starting inference (pipe call)...", t_start)
+    t = time.time()
     out = pipe(
         enable_sr=enable_sr,
         prompt=args.prompt,
@@ -241,6 +269,7 @@ def generate_video(args):
         return_pre_sr_video=args.save_pre_sr_video,
         **extra_kwargs,
     )
+    _log_step("Inference done", t)
     
     if int(os.environ.get('RANK', '0')) == 0:
         output_path = args.output_path
