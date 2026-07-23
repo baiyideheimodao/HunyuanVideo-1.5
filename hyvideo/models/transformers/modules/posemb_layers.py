@@ -215,6 +215,7 @@ def get_nd_rotary_pos_embed(
     use_real=False,
     theta_rescale_factor: Union[float, List[float]] = 1.0,
     interpolation_factor: Union[float, List[float]] = 1.0,
+    riflex_stretch_ratio: float = None,
 ):
     """
     This is a n-d version of precompute_freqs_cis, which is a RoPE for tokens with n-d structure.
@@ -230,6 +231,8 @@ def get_nd_rotary_pos_embed(
             Some libraries such as TensorRT does not support complex64 data type. So it is useful to provide a real
             part and an imaginary part separately.
         theta_rescale_factor (float): Rescale factor for theta. Defaults to 1.0.
+        riflex_stretch_ratio (float, optional): RIFLEx stretch ratio. When > 1.0, only applied to the first
+            (temporal) dimension of rope_dim_list. Defaults to None (disabled).
 
     Returns:
         pos_embed (torch.Tensor): [HW, D/2]
@@ -258,6 +261,8 @@ def get_nd_rotary_pos_embed(
     # use 1/ndim of dimensions to encode grid_axis
     embs = []
     for i in range(len(rope_dim_list)):
+        # RIFLEx: only apply to temporal dimension (i==0, first entry in rope_dim_list)
+        riflex_s = riflex_stretch_ratio if i == 0 else None
         emb = get_1d_rotary_pos_embed(
             rope_dim_list[i],
             grid[i].reshape(-1),
@@ -265,6 +270,7 @@ def get_nd_rotary_pos_embed(
             use_real=use_real,
             theta_rescale_factor=theta_rescale_factor[i],
             interpolation_factor=interpolation_factor[i],
+            riflex_stretch_ratio=riflex_s,
         )  # 2 x [WHD, rope_dim_list[i]]
         embs.append(emb)
 
@@ -285,6 +291,7 @@ def get_1d_rotary_pos_embed(
     use_real: bool = False,
     theta_rescale_factor: float = 1.0,
     interpolation_factor: float = 1.0,
+    riflex_stretch_ratio: float = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Precompute the frequency tensor for complex exponential (cis) with given dimensions.
@@ -301,6 +308,10 @@ def get_1d_rotary_pos_embed(
         use_real (bool, optional): If True, return real part and imaginary part separately.
                                    Otherwise, return complex numbers.
         theta_rescale_factor (float, optional): Rescale factor for theta. Defaults to 1.0.
+        riflex_stretch_ratio (float, optional): RIFLEx stretch ratio for long video stabilization.
+            When > 1.0, applies frequency-dependent scaling: low frequencies get full interpolation,
+            high frequencies extrapolate, with a smooth ramp in between.
+            Only effective for temporal dimension RoPE. Defaults to None (disabled).
 
     Returns:
         freqs_cis: Precomputed frequency tensor with complex exponential. [S, D/2]
@@ -317,6 +328,30 @@ def get_1d_rotary_pos_embed(
     freqs = 1.0 / (
         theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)
     )  # [D/2]
+
+    # RIFLEx: Frequency-dependent scaling for long video temporal RoPE.
+    # Applies different interpolation factors per frequency band:
+    #   - Low freq (idx < half_dim//2): full stretch (interpolation)
+    #   - Mid freq (half_dim//2 to 75%): linear ramp from stretch to 1.0
+    #   - High freq (75% to half_dim): no stretch (extrapolation)
+    if riflex_stretch_ratio is not None and riflex_stretch_ratio > 1.0:
+        half_dim = dim // 2
+        freq_scale = torch.ones(half_dim, device=freqs.device, dtype=freqs.dtype)
+        low_cutoff = half_dim // 2
+        mid_start = low_cutoff
+        mid_end = int(half_dim * 0.75)
+        transition_len = mid_end - mid_start
+        # Low frequencies: full interpolation stretch
+        freq_scale[:low_cutoff] = riflex_stretch_ratio
+        # Mid frequencies: linear ramp
+        if transition_len > 0:
+            freq_scale[mid_start:mid_end] = 1.0 + \
+                (riflex_stretch_ratio - 1.0) * \
+                torch.linspace(1.0, 0.0, transition_len,
+                               device=freqs.device, dtype=freqs.dtype)
+        # High frequencies [mid_end:]: keep 1.0 (extrapolation)
+        freqs = freqs * freq_scale
+
     # assert interpolation_factor == 1.0, f"interpolation_factor: {interpolation_factor}"
     freqs = torch.outer(pos * interpolation_factor, freqs)  # [S, D/2]
     if use_real:

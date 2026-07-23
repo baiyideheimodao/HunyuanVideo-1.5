@@ -250,6 +250,11 @@ class HunyuanVideo_1_5_SR_Pipeline(HunyuanVideo_1_5_Pipeline):
         latent_target_length, latent_height, latent_width = self.get_latent_size(video_length, height, width)
         n_tokens = latent_target_length * latent_height * latent_width
 
+        # RIFLEx: compute temporal stretch ratio for long video stabilization.
+        training_latent_frames = getattr(self.transformer, 'training_temporal_latent_frames', 30)
+        riflex_stretch_ratio = max(1.0, latent_target_length / training_latent_frames) \
+            if latent_target_length > training_latent_frames else None
+
         self._guidance_scale = guidance_scale
         self._guidance_rescale = kwargs.get("guidance_rescale", 0.0)
         self._clip_skip = kwargs.get("clip_skip", None)
@@ -426,6 +431,7 @@ class HunyuanVideo_1_5_SR_Pipeline(HunyuanVideo_1_5_Pipeline):
                         guidance=guidance_expand,
                         return_dict=False,
                         extra_kwargs=extra_kwargs,
+                        riflex_stretch_ratio=riflex_stretch_ratio,
                     )
                     noise_pred = output[0]
 

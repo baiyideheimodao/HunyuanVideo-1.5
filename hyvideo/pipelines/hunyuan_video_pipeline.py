@@ -1059,6 +1059,13 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         n_tokens = latent_target_length * latent_height * latent_width
         multitask_mask = self.get_task_mask(task_type, latent_target_length)
 
+        # RIFLEx: compute temporal stretch ratio for long video stabilization.
+        # When inference latent frames > training latent frames, enables frequency-
+        # dependent interpolation to prevent temporal RoPE from degrading.
+        training_latent_frames = getattr(self.transformer, 'training_temporal_latent_frames', 30)
+        riflex_stretch_ratio = max(1.0, latent_target_length / training_latent_frames) \
+            if latent_target_length > training_latent_frames else None
+
 
         self._guidance_scale = guidance_scale
         self._guidance_rescale = kwargs.get("guidance_rescale", 0.0)
@@ -1249,6 +1256,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                         guidance=guidance_expand,
                         return_dict=False,
                         extra_kwargs=extra_kwargs,
+                        riflex_stretch_ratio=riflex_stretch_ratio,
                     )
                     noise_pred = output[0]
 

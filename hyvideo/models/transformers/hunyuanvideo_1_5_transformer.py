@@ -392,6 +392,10 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
         self.guidance_embed = guidance_embed
         self.rope_dim_list = rope_dim_list
         self.rope_theta = rope_theta
+        # RIFLEx: training-time reference for temporal latent frames.
+        # Used to compute riflex_stretch_ratio at inference for long video stabilization.
+        # Default 30 corresponds to ~121 frames at 24fps (5s video) with VAE temporal compression factor 4.
+        self.training_temporal_latent_frames = 30
         # Text projection. Default to linear projection.
         # Alternative: TokenRefiner. See more details (LI-DiT): http://arxiv.org/abs/2406.11831
         self.use_attention_mask = use_attention_mask
@@ -610,7 +614,7 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
         for block in self.single_blocks:
             block.disable_deterministic()
 
-    def get_rotary_pos_embed(self, rope_sizes):
+    def get_rotary_pos_embed(self, rope_sizes, riflex_stretch_ratio=None):
         target_ndim = 3
         head_dim = self.hidden_size // self.heads_num
         rope_dim_list = self.rope_dim_list
@@ -625,6 +629,7 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
             theta=self.rope_theta,
             use_real=True,
             theta_rescale_factor=1,
+            riflex_stretch_ratio=riflex_stretch_ratio,
         )
         return freqs_cos, freqs_sin
 
@@ -682,6 +687,7 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
         guidance=None,
         mask_type="t2v",
         extra_kwargs=None,
+        riflex_stretch_ratio: float = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
 
         if guidance is None:
@@ -701,7 +707,8 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
         )
         self.attn_param['thw'] = [tt, th, tw]
         if freqs_cos is None and freqs_sin is None:
-            freqs_cos, freqs_sin = self.get_rotary_pos_embed((tt, th, tw))
+            freqs_cos, freqs_sin = self.get_rotary_pos_embed((tt, th, tw),
+                                                             riflex_stretch_ratio=riflex_stretch_ratio)
 
         img = self.img_in(img)
         parallel_dims = get_parallel_state()
