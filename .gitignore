@@ -141,6 +141,10 @@ outputs/
 *.avi
 *.mov
 *.gif
+# Assets images are tracked via LFS
+!assets/*.png
+!assets/*.jpg
+!assets/*.jpeg
 *.png
 *.jpg
 *.jpeg
@@ -168,6 +172,10 @@ cache/
 ckpts/
 
 
-hyvideo/utils/rewrite/i2v_env.sh
+# Local scripts and files
 hfd.sh
-flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.1.whl
+*.whl
+*.tar.gz
+
+# Claude Code
+.claude/
